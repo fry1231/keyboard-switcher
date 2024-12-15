@@ -8,6 +8,9 @@ This app simply does the job.
 
 (at least for me)
 
+You need to disable the system language switching first, manually or by using the app.
+
+
 ![preview](https://github.com/fry1231/lang-switcher/blob/main/preview.png)
 
 ## Features
