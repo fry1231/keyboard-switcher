@@ -3,24 +3,25 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/signal"
 	"time"
+	"encoding/json"
+	"path/filepath"
+	"syscall"
 	"unsafe"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/app"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/widget"
-	"github.com/moutend/go-hook/pkg/keyboard"
-	"github.com/moutend/go-hook/pkg/types"
 	"golang.org/x/sys/windows"
+	. "github.com/lxn/walk/declarative"
+	"github.com/lxn/walk"
+	"github.com/lxn/win"
 )
 
 var (
 	user32                 = windows.NewLazySystemDLL("user32.dll")
+	kernel32               = windows.NewLazySystemDLL("kernel32.dll")
 	getKeyboardLayoutList  = user32.NewProc("GetKeyboardLayoutList")
 	postMessage            = user32.NewProc("PostMessageW")
 	getForegroundWindow    = user32.NewProc("GetForegroundWindow")
+	createMutex           = kernel32.NewProc("CreateMutexW")
 	firstPressed           bool
 	secondPressed          bool
 	firstPressTime         time.Time
@@ -28,11 +29,10 @@ var (
 	timeThreshold          = 50 * time.Millisecond
 	firstKeyName           string
 	secondKeyName          string
+	configChan            = make(chan Config)
 )
 
 const (
-	WM_INPUTLANGCHANGEREQUEST = 0x0050
-	HWND_BROADCAST            = 0xffff
 	LANG_TOGGLE               = 0x0001
 	VK_MENU                   = 0x12
 	VK_LMENU                  = 0xA4
@@ -43,181 +43,263 @@ const (
 	VK_CONTROL                = 0x11
 	VK_LCONTROL               = 0xA2
 	VK_RCONTROL               = 0xA3
+
+	SIZE_W = 322
+    SIZE_H = 228
 )
 
-func keyMatch(vkCode uint32, keyName string) bool {
-	if keyName == "LeftAlt" {
-		return vkCode == VK_LMENU
-	}
-	if keyName == "Shift" {
-		return vkCode == VK_SHIFT || vkCode == VK_LSHIFT || vkCode == VK_RSHIFT
-	}
-	if keyName == "Ctrl" {
-		return vkCode == VK_CONTROL || vkCode == VK_LCONTROL || vkCode == VK_RCONTROL
-	}
-	return false
+func showError(err error) {
+	walk.MsgBox(nil, "Error", err.Error(), walk.MsgBoxIconError)
 }
 
-func getCurrentKeyboardLayout() uintptr {
-	hwnd, _, _ := getForegroundWindow.Call()
-	threadID, _, _ := user32.NewProc("GetWindowThreadProcessId").Call(hwnd, 0)
-	layout, _, _ := user32.NewProc("GetKeyboardLayout").Call(threadID)
-	return layout
+
+type Config struct {
+	SwitchOnAlt bool
 }
 
-func createGUI() (string, string) {
-	myApp := app.New()
-	window := myApp.NewWindow("Keyboard Layout Switcher")
-
-	// Create radio buttons for first key
-	firstKeySelect := widget.NewRadioGroup([]string{"LeftAlt", "Ctrl"}, nil)
-	firstKeySelect.SetSelected("LeftAlt")
-
-	// Create radio buttons for second key
-	secondKeySelect := widget.NewRadioGroup([]string{"Shift"}, nil)
-	secondKeySelect.SetSelected("Shift")
-
-	// Create start button
-	startBtn := widget.NewButton("Start", nil)
-
-	// Channel to get the selected values
-	resultChan := make(chan struct{})
-
-	var selectedFirst, selectedSecond string
-
-	startBtn.OnTapped = func() {
-		selectedFirst = firstKeySelect.Selected
-		selectedSecond = secondKeySelect.Selected
-		window.Close()
-		resultChan <- struct{}{}
+func (c *Config) SaveToFile() error {
+	execPath, err := os.Executable()
+	if err != nil {
+		return err
 	}
-
-	// Layout
-	content := container.NewVBox(
-		widget.NewLabel("Select first key:"),
-		firstKeySelect,
-		widget.NewLabel("Select second key:"),
-		secondKeySelect,
-		startBtn,
-	)
-
-	window.SetContent(content)
-	window.Resize(fyne.NewSize(300, 200))
+	configPath := filepath.Join(filepath.Dir(execPath), "config.json")
+	data, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
 	
-	// Show window in a goroutine
-	go window.ShowAndRun()
+	return os.WriteFile(configPath, data, 0644)
+}
 
-	// Wait for selection
-	<-resultChan
+func LoadConfig() (*Config, error) {
+	execPath, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	configPath := filepath.Join(filepath.Dir(execPath), "config.json")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Return default config if file doesn't exist
+			return &Config{true}, nil
+		}
+		return nil, err
+	}
+	
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+	
+	return &config, nil
+}
 
-	return selectedFirst, selectedSecond
+
+type MyMainWindow struct {
+	*walk.MainWindow
+	notifyIcon *walk.NotifyIcon
 }
 
 func main() {
-	layouts := getKeyboardLayouts()
-	if len(layouts) < 2 {
-		fmt.Println("Less than 2 keyboard layouts installed")
+	// Ensure there is only one instance of the program
+	// Create a named mutex
+	mutexName, err := syscall.UTF16PtrFromString("Global\\WinLangSwitcherMutex")
+	if err != nil {
+		showError(fmt.Errorf("Error creating mutex name: %v", err))
 		return
 	}
 
-	// Get key combination from GUI
-	firstKeyName, secondKeyName = createGUI()
-
-	fmt.Printf("Selected combination: %s + %s\n", firstKeyName, secondKeyName)
-	fmt.Println("Language switcher started")
-	fmt.Println("Press Ctrl+C to exit.")
-
-	keyboardChan := make(chan types.KeyboardEvent)
-	if err := keyboard.Install(nil, keyboardChan); err != nil {
-		fmt.Printf("Error installing keyboard hook: %v\n", err)
+	handle, _, errNo := createMutex.Call(0, 1, uintptr(unsafe.Pointer(mutexName)))
+	if handle == 0 {
+		showError(fmt.Errorf("Failed to create mutex"))
 		return
 	}
-	defer keyboard.Uninstall()
+	defer windows.CloseHandle(windows.Handle(handle))
 
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
+	// Check if the mutex already existed
+	if errNo == syscall.ERROR_ALREADY_EXISTS {
+		showError(fmt.Errorf("Another instance is already running"))
+		return
+	}
 
-	for {
-		select {
-		case <-signalChan:
+	icon, err := walk.Resources.Icon("APP")
+	if err != nil {
+		showError(err)
+		return
+	}
+
+	currentConfig, err := LoadConfig()
+	if err != nil {
+		execPath, _ := os.Executable()
+		workDir, _ := os.Getwd()
+		showError(fmt.Errorf("Error loading config: %v\nExecutable path: %s\nWorking directory: %s\nUsing default configuration", 
+			err, execPath, workDir))
+		currentConfig = &Config{true}
+	}
+
+	go watcherTask(currentConfig)
+
+	var autostartButton *walk.PushButton
+	var shortcutsButton *walk.PushButton
+	var shortcutLabel *walk.TextLabel
+
+	updateAutostartButtonText := func() {
+		enabled, err := isAutostartEnabled()
+		if err != nil {
+			fmt.Printf("Error checking autostart status: %v\n", err)
 			return
-		case k := <-keyboardChan:
-			fmt.Printf("Key event - Message: %v, VKC         ode: %v (0x%X)\n", k.Message, k.VKCode, k.VKCode)
-			isKeyDown := (k.Message == types.WM_KEYDOWN) || (k.Message == types.WM_SYSKEYDOWN)
-			isKeyUp := (k.Message == types.WM_KEYUP) || (k.Message == types.WM_SYSKEYUP)
-			vkCode := uint32(k.VKCode)
-
-			if isKeyDown {
-				if keyMatch(vkCode, firstKeyName) {
-					firstPressed = true
-					firstPressTime = time.Now()
-					if secondPressed || time.Since(secondPressTime) <= timeThreshold {
-						switchLanguage()
-					}
-				} else if keyMatch(vkCode, secondKeyName) {
-					secondPressed = true 
-					secondPressTime = time.Now()
-					if firstPressed || time.Since(firstPressTime) <= timeThreshold {
-						switchLanguage()
-					}
-				}
-			} else if isKeyUp {
-				if keyMatch(vkCode, firstKeyName) {
-					firstPressed = false
-				} else if keyMatch(vkCode, secondKeyName) {
-					secondPressed = false
-				}
-			}
 		}
-	}
-}
-
-func getKeyboardLayouts() []uintptr {
-	count, _, _ := getKeyboardLayoutList.Call(0, 0)
-	if count == 0 {
-		return nil
-	}
-
-	layouts := make([]windows.Handle, count)
-	getKeyboardLayoutList.Call(
-		uintptr(count),
-		uintptr(unsafe.Pointer(&layouts[0])),
-	)
-
-	// Convert to uintptr slice
-	result := make([]uintptr, count)
-	for i, layout := range layouts {
-		result[i] = uintptr(layout)
-	}
-
-	return result
-}
-
-func switchLanguage() {
-	layouts := getKeyboardLayouts()
-
-	currentLayout := getCurrentKeyboardLayout()
-	fmt.Printf("Current layout: 0x%X\n", currentLayout)
-	fmt.Printf("Available layouts: %v\n", layouts)
-
-	// Find next layout
-	nextLayout := layouts[0]
-	for i, layout := range layouts {
-		if layout == currentLayout {
-			nextLayout = layouts[(i+1)%len(layouts)]
-			break
+		if enabled {
+			autostartButton.SetText("Remove from Autostart")
+		} else {
+			autostartButton.SetText("Add to Autostart")
 		}
 	}
 
-	fmt.Printf("Switching to layout: 0x%X\n", nextLayout)
+	updateShortcutLabel := func() {
+		keyIndex, err := getSystemKeyboardShortcutsStatus()
+		if err != nil {
+			fmt.Printf("Error getting system keyboard shortcuts status: %v\n", err)
+			shortcutLabel.SetText("System shortcut: Unknown")
+			return
+		}
+		if keyIndex == 1 {
+			shortcutLabel.SetText("System shortcut: LeftAlt+Shift")
+		} else if keyIndex == 2 {
+			shortcutLabel.SetText("System shortcut: Ctrl+Shift")
+		} else if keyIndex == 3 {
+			shortcutLabel.SetText("System shortcut: Disabled")
+		} else if keyIndex == 4 {
+			shortcutLabel.SetText("System shortcut: ` (Grave accent)")
+		}
+	}
 
-	hwnd, _, _ := getForegroundWindow.Call()
+	isAutostart := isStartedFromAutostart()
 
-	ret, _, err := postMessage.Call(
-		hwnd,
-		WM_INPUTLANGCHANGEREQUEST,
-		0,
-		nextLayout,
-	)
-	fmt.Printf("PostMessage result: %v, error: %v\n", ret, err)
+	mw := new(MyMainWindow)
+
+	MainWindow{
+		Title:   "WIN Language Switcher",
+		MinSize: Size{SIZE_W, SIZE_H},
+		Size:    Size{SIZE_W, SIZE_H},
+		MaxSize: Size{SIZE_W, SIZE_H},
+		Layout:  VBox{},
+		AssignTo: &mw.MainWindow,
+		Icon:     icon,
+		DataBinder: DataBinder{
+			DataSource: currentConfig,
+			AutoSubmit: true,
+			OnSubmitted: func() {
+				configChan <- *currentConfig
+				if err := currentConfig.SaveToFile(); err != nil {
+					showError(fmt.Errorf("Error saving config: %v", err))
+				}
+			},
+		},
+		Children: []Widget{
+			RadioButtonGroup{
+				DataMember: "SwitchOnAlt",
+				Buttons: []RadioButton{
+					RadioButton{
+						Name:  "aRB",
+						Text:  "LeftAlt+Shift",
+						Value: true,
+					},
+					RadioButton{
+						Name:  "bRB",
+						Text:  "Ctrl+Shift",
+						Value: false,
+					},
+				},
+			},
+			TextLabel{
+				AssignTo: &shortcutLabel,
+				Text:     "System shortcut: Alt+Shift",
+			},
+			PushButton{
+				AssignTo: &shortcutsButton,
+				Text:     "Disable System Shortcuts",
+				MinSize:  Size{200, 30},
+				MaxSize:  Size{200, 30},
+				OnClicked: func() {
+					err := disableSystemKeyboardShortcuts()
+					if err != nil {
+						walk.MsgBox(nil, "Error", 
+							fmt.Sprintf("Failed to toggle system shortcuts: %v", err),
+							walk.MsgBoxIconError)
+						return
+					}
+					updateShortcutLabel()
+				},
+			},
+			PushButton{
+				AssignTo: &autostartButton,
+				Text:     "Add to Autostart",
+				MinSize:  Size{200, 30},
+				MaxSize:  Size{200, 30},
+				OnClicked: func() {
+					err := toggleAutostart()
+					if err != nil {
+						walk.MsgBox(nil, "Error", 
+							fmt.Sprintf("Failed to toggle autostart: %v", err),
+							walk.MsgBoxIconError)
+						return
+					}
+					updateAutostartButtonText()
+				},
+			},
+			PushButton{
+				Text: "Minimize to tray",
+				MinSize: Size{200, 30},
+				MaxSize: Size{200, 30},
+				OnClicked: func() {
+					mw.Hide()
+				},
+			},
+		},
+	}.Create()
+	
+	// Make window unresizable
+    defaultStyle := win.GetWindowLong(mw.Handle(), win.GWL_STYLE) // Gets current style
+    newStyle := defaultStyle &^ win.WS_THICKFRAME                 // Remove WS_THICKFRAME
+    win.SetWindowLong(mw.Handle(), win.GWL_STYLE, newStyle)
+
+    xScreen := win.GetSystemMetrics(win.SM_CXSCREEN);
+    yScreen := win.GetSystemMetrics(win.SM_CYSCREEN);
+    win.SetWindowPos(
+        mw.Handle(),
+        0,
+        (xScreen - SIZE_W)/2,
+        (yScreen - SIZE_H)/2,
+        SIZE_W,
+        SIZE_H,
+        win.SWP_FRAMECHANGED,
+    )
+    win.ShowWindow(mw.Handle(), win.SW_SHOW);
+
+	updateAutostartButtonText()
+	updateShortcutLabel()
+
+	ni, err := walk.NewNotifyIcon(mw)
+	if err != nil {
+		showError(err)
+		return
+	}
+	defer ni.Dispose()
+
+	ni.SetIcon(icon)
+	ni.SetVisible(true)
+
+	ni.MouseUp().Attach(func(x, y int, button walk.MouseButton) {
+		if button == walk.LeftButton {
+			mw.Show()
+			mw.SetFocus()
+		}
+	})
+
+	if isAutostart {
+		mw.Hide()
+	}
+
+	mw.Run()
 }

@@ -1,2 +1,2 @@
-/lang_change.exe
-/lang_change.exe~
+*.exe
+/.*
