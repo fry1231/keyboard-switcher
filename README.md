@@ -1,8 +1,14 @@
 # Windows Language Switcher
 
 Sometimes language switching is not working as expected in Windows 11.
+
+
 This app simply does the job.
+
+
 (at least for me)
+
+![preview](https://github.com/fry1231/lang-switcher/blob/main/preview.png)
 
 ## Features
 
@@ -15,7 +21,7 @@ This app simply does the job.
 
 ## Installation
 
-1. Download the latest release from the releases page
+1. Download the latest release from the [releases page](https://github.com/fry1231/lang-switcher/releases)
 2. Run the executable
 
 
